@@ -37,6 +37,7 @@ def job_json(job_id: int) -> dict:
     if job is None:
         raise HTTPException(404, "job not found")
     counts = db.counts(job_id)
+    verify = db.verify_counts(job_id)
     out = {
         "id": job["id"],
         "url": job["url"],
@@ -48,6 +49,8 @@ def job_json(job_id: int) -> dict:
         "expected": counts["total"],
         "saved": counts["done"],
         "missing": db.missing_seqs(job_id),
+        "verify": verify,
+        "conflicts": db.conflict_seqs(job_id),
         "error": job["error"],
         "download_url": f"/api/jobs/{job_id}/download" if job["state"] == "done" else None,
     }
@@ -84,13 +87,37 @@ async def get_job(job_id: int):
     return job_json(job_id)
 
 
+@app.get("/api/jobs/{job_id}/segments")
+async def get_segments(job_id: int):
+    """Per-segment verification view. A segment is only called consistent when
+    it actually passed a re-fetch; unverified and no-opportunity segments are
+    reported distinctly."""
+    job = db.get_job(job_id)
+    if job is None:
+        raise HTTPException(404, "job not found")
+    return [
+        {
+            "seq": s["seq"],
+            "url": s["url"],
+            "status": s["status"],
+            "sha256": s["sha256"],
+            "verify_status": s["verify_status"],
+            "verify_attempts": s["verify_attempts"],
+            "error": s["error"],
+        }
+        for s in db.list_segments(job_id)
+    ]
+
+
 @app.get("/api/jobs/{job_id}/download")
 async def download(job_id: int):
     job = db.get_job(job_id)
     if job is None:
         raise HTTPException(404, "job not found")
     if job["state"] != "done" or not job["zip_path"] or not os.path.exists(job["zip_path"]):
-        raise HTTPException(409, "全部应收片段保存后才可下载")
+        if job["state"] == "failed":
+            raise HTTPException(409, "任务失败（含片段复核冲突），禁止下载")
+        raise HTTPException(409, "全部应收片段保存并完成复核后才可下载")
     return FileResponse(job["zip_path"], media_type="application/zip",
                         filename=f"recording_{job_id}.zip")
 
@@ -115,3 +142,8 @@ if os.environ.get("RECORDER_TEST_HOOKS") == "1":
     async def _test_arm_after_write(job_id: int, seq: int):
         TEST_HOOKS["crash_after_write"] = (job_id, seq)
         return {"armed": [job_id, seq]}
+
+    @app.post("/api/_test/verify_delay/{seconds}")
+    async def _test_verify_delay(seconds: float):
+        TEST_HOOKS["verify_delay"] = max(0.0, seconds)
+        return {"verify_delay": TEST_HOOKS["verify_delay"]}

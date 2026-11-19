@@ -1,12 +1,28 @@
 """Recording engine.
 
 Each job runs a playlist poller (follows the sliding window, keyed on media
-sequence numbers) and a downloader (persists every expected segment). State
-and progress live in SQLite; segment bytes live on the persistent volume, so a
-restart can resume exactly where it stopped.
+sequence numbers), a downloader (persists every expected segment) and a
+verifier pool. A segment is hashed (SHA-256) on its first save; whenever the
+same sequence number shows up again in a later playlist the verifier
+re-fetches that URL *as a stream* and compares hashes. Re-fetches run in
+independent tasks, so they never block polling, downloading, stop handling or
+the query API.
+
+Verification outcomes per segment:
+
+  unverified      saved, no matching re-fetch yet (or one is in flight)
+  verifying       a re-fetch is currently in progress
+  verified        a re-fetch reproduced the exact same bytes
+  conflict        a re-fetch returned different bytes for the same seq+URL
+  no_opportunity  the segment slid out of every later playlist before it
+                  could ever be re-fetched -- explicitly NOT consistent
+
+A conflict fails the whole recording and forbids download; conflict and
+pending-verification states are persisted and survive restarts.
 """
 
 import asyncio
+import hashlib
 import logging
 import os
 import zipfile
@@ -19,10 +35,13 @@ log = logging.getLogger("recorder")
 
 MAX_POLL_ERRORS = 15          # consecutive playlist fetch failures before failing the job
 MAX_DOWNLOAD_ATTEMPTS = 5     # per segment, transient errors only (404 fails immediately)
+MAX_VERIFY_ATTEMPTS = 3       # per re-fetch round, transient errors only
+VERIFIER_WORKERS = 2          # concurrent streaming re-fetches per job
 
-# Test-only hook (active solely when RECORDER_TEST_HOOKS=1): crash the process
-# right after a segment is fully written but before it is registered in the DB.
-TEST_HOOKS = {"crash_after_write": None}  # (job_id, seq)
+# Test-only hooks (active solely when RECORDER_TEST_HOOKS=1):
+#   crash_after_write: crash between a segment being written and registered
+#   verify_delay:      seconds to sleep while streaming a verification re-fetch
+TEST_HOOKS = {"crash_after_write": None, "verify_delay": 0.0}
 
 
 class SourceError(Exception):
@@ -37,6 +56,8 @@ class JobRunner:
         self.wake = asyncio.Event()
         self.poller: asyncio.Task | None = None
         self.downloader: asyncio.Task | None = None
+        self.verifiers: list[asyncio.Task] = []
+        self.verify_queue: asyncio.Queue = asyncio.Queue()
         self.poll_interval = 1.0
 
     # ---- paths ----
@@ -53,10 +74,17 @@ class JobRunner:
     def start(self):
         os.makedirs(self.seg_dir, exist_ok=True)
         self._reconcile_disk()
+        self.db.reset_stale_verifying(self.job_id)
         job = self.db.get_job(self.job_id)
         if job["state"] == "recording":
             self.poller = asyncio.create_task(self._poll_loop(), name=f"poll-{self.job_id}")
         self.downloader = asyncio.create_task(self._download_loop(), name=f"dl-{self.job_id}")
+        for i in range(VERIFIER_WORKERS):
+            self.verifiers.append(
+                asyncio.create_task(self._verify_loop(i), name=f"verify-{self.job_id}-{i}"))
+        # Rebuild the verification queue from persisted state after a restart.
+        for seg in self.db.list_unverified_done(self.job_id):
+            self._enqueue_verify(seg["seq"])
         log.info("job %s started/resumed in state %s", self.job_id, job["state"])
 
     def _reconcile_disk(self):
@@ -70,7 +98,9 @@ class JobRunner:
                 self.db.segment_pending(self.job_id, seg["seq"])
             elif seg["status"] == "pending" and os.path.exists(path) and os.path.getsize(path) > 0:
                 log.info("job %s seq %s: adopting fully written segment from disk", self.job_id, seg["seq"])
-                self.db.segment_done(self.job_id, seg["seq"], path, os.path.getsize(path))
+                with open(path, "rb") as fh:
+                    digest = hashlib.file_digest(fh, "sha256").hexdigest()
+                self.db.segment_done(self.job_id, seg["seq"], path, os.path.getsize(path), digest)
         for name in os.listdir(self.seg_dir):
             if name.endswith(".part"):
                 try:
@@ -130,6 +160,10 @@ class JobRunner:
             if row is not None:
                 if row["url"] is not None and row["url"] != seg.url:
                     raise SourceError(f"序号 {seg.seq} 的片段地址发生变化（源不一致）")
+                # Same seq and same URL in a later playlist: this is a
+                # verification opportunity. Re-fetch and compare hashes.
+                if row["status"] == "done" and row["verify_status"] == "unverified":
+                    self._enqueue_verify(seg.seq)
                 continue
             dup = self.db.get_segment_by_url(self.job_id, seg.url)
             if dup is not None:
@@ -138,9 +172,109 @@ class JobRunner:
             self.db.insert_segment(self.job_id, seg.seq, seg.url, seg.duration, seg.title)
         self.wake.set()
 
+        # Segments that already slid out of this playlist and were never
+        # re-fetched get no further chance: mark them explicitly so the UI can
+        # never report an unverified segment as consistent.
+        self.db.mark_slipped_unverified(
+            self.job_id, pl.media_sequence, self._queued_seqs())
+
         if pl.endlist:
             log.info("job %s source signalled ENDLIST, pinning boundary", self.job_id)
             self.mgr.accept_stop(self.job_id)
+
+    # ---- verification scheduling ----
+
+    def _queued_seqs(self) -> list:
+        return list(self.verify_queue._queue)
+
+    def _enqueue_verify(self, seq: int):
+        # Idempotent: the same seq may appear in several consecutive windows.
+        if seq not in self._queued_seqs():
+            self.verify_queue.put_nowait(seq)
+
+    async def _verify_loop(self, worker: int):
+        # Keep re-fetching while the job may still need results, including the
+        # whole finalizing phase: a stop must not cancel in-flight verification,
+        # and no ZIP is published until this queue has fully drained.
+        while True:
+            job = self.db.get_job(self.job_id)
+            if job["state"] in ("failed", "done"):
+                return
+            seq = await self.verify_queue.get()
+            try:
+                await self._verify_one(seq, worker)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Never strand a segment in 'verifying': give it another chance.
+                log.exception("job %s verifier %s crashed on seq %s", self.job_id, worker, seq)
+                self.db.bump_verify_attempts(self.job_id, seq)
+            finally:
+                self.verify_queue.task_done()
+
+    async def _verify_one(self, seq: int, worker: int):
+        seg = self.db.get_segment(self.job_id, seq)
+        if seg is None or seg["status"] != "done" or seg["verify_status"] != "unverified":
+            return  # conflict/verified/no_opportunity meanwhile, or re-downloaded
+        self.db.mark_verifying(self.job_id, seq)
+        url, want_hash = seg["url"], seg["sha256"]
+        delay = 0.5
+        try:
+            for attempt in range(1, MAX_VERIFY_ATTEMPTS + 1):
+                try:
+                    got_hash = await self._stream_hash(url)
+                    # The segment may have slid out of the window (no_opportunity)
+                    # or been re-downloaded while this stream was in flight.
+                    cur = self.db.get_segment(self.job_id, seq)
+                    if cur is None or cur["verify_status"] != "verifying":
+                        log.info("job %s seq %s 复核返回时状态已变为 %s，放弃该结论",
+                                 self.job_id, seq,
+                                 cur["verify_status"] if cur else "gone")
+                        return
+                    if got_hash == want_hash:
+                        self.db.mark_verified(self.job_id, seq)
+                        log.info("job %s seq %s 复核一致", self.job_id, seq)
+                    else:
+                        self.db.mark_conflict(self.job_id, seq)
+                        log.error("job %s seq %s 同序号同地址片段内容被改写（SHA-256 冲突）",
+                                  self.job_id, seq)
+                        self.mgr.fail_job(
+                            self.job_id,
+                            f"片段原件复核冲突: 序号 {seq} 的同地址 TS 内容被改写"
+                            f"（原 SHA-256 {want_hash[:12]}…，复取 {got_hash[:12]}…）")
+                    return
+                except httpx.HTTPError as exc:
+                    self.db.bump_verify_attempts(self.job_id, seq)
+                    if attempt >= MAX_VERIFY_ATTEMPTS:
+                        # Leave it unverified; finalize gives it one last round,
+                        # and if the source is gone it closes as no_opportunity.
+                        log.warning("job %s seq %s 复核复取失败，保留待复核: %s",
+                                    self.job_id, seq, exc)
+                        return
+                    log.warning("job %s seq %s 复核尝试 %s 失败: %s",
+                                self.job_id, seq, attempt, exc)
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, 8.0)
+        except asyncio.CancelledError:
+            log.info("job %s seq %s 复核被中断（重启后继续）", self.job_id, seq)
+            raise
+
+    async def _stream_hash(self, url: str) -> str:
+        """Re-fetch a segment as a stream and hash it incrementally. The body
+        is never buffered whole and nothing is written to disk, so concurrent
+        recordings, stop handling and queries stay responsive."""
+        hasher = hashlib.sha256()
+        client = self.mgr.client
+        async with client.stream("GET", url, timeout=httpx.Timeout(60.0, connect=10.0)) as resp:
+            if resp.status_code == 404:
+                raise httpx.HTTPError("HTTP 404")
+            if resp.status_code != 200:
+                raise httpx.HTTPError(f"HTTP {resp.status_code}")
+            async for chunk in resp.aiter_bytes(chunk_size=64 * 1024):
+                hasher.update(chunk)
+                if TEST_HOOKS["verify_delay"]:
+                    await asyncio.sleep(TEST_HOOKS["verify_delay"])
+        return hasher.hexdigest()
 
     # ---- segment downloading ----
 
@@ -181,10 +315,11 @@ class JobRunner:
                 if resp.status_code != 200:
                     raise httpx.HTTPError(f"HTTP {resp.status_code}")
                 data = resp.content
+                digest = hashlib.sha256(data).hexdigest()
                 await asyncio.to_thread(self._write_segment, tmp, path, data)
                 if TEST_HOOKS["crash_after_write"] == (self.job_id, seq):
                     os._exit(137)  # test hook: die between flush and DB register
-                self.db.segment_done(self.job_id, seq, path, len(data))
+                self.db.segment_done(self.job_id, seq, path, len(data), digest)
                 return
             except httpx.HTTPError as exc:
                 log.warning("job %s seq %s download attempt %s failed: %s",
@@ -203,12 +338,43 @@ class JobRunner:
 
     # ---- finalize ----
 
+    async def _drain_verifications(self):
+        """Wait until every verification that has started (or been queued)
+        has settled. A ZIP must never be published while one is outstanding."""
+        while True:
+            if self.db.get_job(self.job_id)["state"] == "failed":
+                return
+            await self.verify_queue.join()
+            # Everything queued has been processed. Rows still 'unverified'
+            # are ones whose re-fetch failed transiently; the caller decides
+            # whether to give them another round or close them out.
+            return
+
     async def _finalize(self, job: dict):
         segs = self.db.list_segments(self.job_id)
         if any(s["status"] == "missing" for s in segs):
             return  # fail_job already ran / will run
         if any(s["status"] != "done" for s in segs):
             return  # still waiting for downloads; wake will re-enter
+
+        # The poller is already stopped: unverified segments that are still
+        # within the pinned boundary get one last re-fetch round.
+        for seg in self.db.list_unverified_done(self.job_id):
+            self._enqueue_verify(seg["seq"])
+        await self._drain_verifications()
+
+        job = self.db.get_job(self.job_id)
+        if job["state"] == "failed":
+            return  # a conflict was found during the last-chance round
+        # Segments the source no longer serves could not be verified; record
+        # that explicitly rather than pretending they matched.
+        self.db.mark_remaining_unverified_no_opportunity(self.job_id)
+
+        segs = self.db.list_segments(self.job_id)
+        conflicts = [s["seq"] for s in segs if s["verify_status"] == "conflict"]
+        if conflicts:
+            self.mgr.fail_job(self.job_id, f"片段原件复核冲突，序号: {conflicts}")
+            return
         first = job["first_seq"]
         target = job["target_duration"] or 2.0
         lines = [
@@ -248,6 +414,7 @@ class Manager:
         self.client = httpx.AsyncClient(
             follow_redirects=True,
             headers={"User-Agent": "hls-live-recorder/1.0"},
+            limits=httpx.Limits(max_connections=32, max_keepalive_connections=16),
         )
         self.runners: dict[int, JobRunner] = {}
 
@@ -273,7 +440,9 @@ class Manager:
 
     def accept_stop(self, job_id: int) -> bool:
         """Pin the boundary at the tail of the last received playlist and
-        persist it immediately, so a restart cannot change it."""
+        persist it immediately, so a restart cannot change it. In-flight
+        verifications keep running; the downloader waits for them before any
+        ZIP is published."""
         job = self.db.get_job(job_id)
         if job is None or job["state"] != "recording":
             return False
@@ -298,7 +467,7 @@ class Manager:
     async def shutdown(self):
         tasks = []
         for runner in self.runners.values():
-            for task in (runner.poller, runner.downloader):
+            for task in (runner.poller, runner.downloader, *runner.verifiers):
                 if task is not None and not task.done():
                     task.cancel()
                     tasks.append(task)

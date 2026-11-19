@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <title>HLS 直播连续录音采集</title>
 <style>
-  body { font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 1100px; color: #222; }
+  body { font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 1200px; color: #222; }
   h1 { font-size: 1.4rem; }
   .card { border: 1px solid #ddd; border-radius: 8px; padding: 1rem 1.2rem; margin-bottom: 1.2rem; }
   input[type=text] { width: 70%; padding: .45rem; font-size: .95rem; }
@@ -18,6 +18,15 @@
   .err { color: #c62828; }
   .muted { color: #777; font-size: .85rem; }
   code { background: #f4f4f4; padding: 0 .3rem; border-radius: 4px; }
+  .verify-line { font-size: .82rem; margin-top: .25rem; }
+  .v-verified { color: #2e7d32; font-weight: 600; }
+  .v-conflict { color: #c62828; font-weight: 700; }
+  .v-unverified { color: #ef6c00; font-weight: 600; }
+  .v-no_opportunity { color: #8a6d3b; font-weight: 600; }
+  .v-verifying { color: #1565c0; font-weight: 600; }
+  .detail { display: none; margin-top: .5rem; }
+  .detail table { font-size: .8rem; background: #fafafa; }
+  .hash { font-family: monospace; font-size: .75rem; color: #555; word-break: break-all; }
 </style>
 </head>
 <body>
@@ -30,23 +39,49 @@
   </div>
   <p class="muted">
     仅接受单层、未加密、无不连续标记的 MPEG-TS 媒体清单，片段地址不复用。
+    片段首次保存即记录 SHA-256；同序号片段再次出现在后续清单时流式复取并比对。
     本机直播源示例：<code>http://livesource:8080/live.m3u8</code>（普通）、
     <code>http://livesource:8080/live.m3u8?delay_ms=1500</code>（慢下载）、
     <code>http://livesource:8080/live.m3u8?missing=12</code>（缺段）、
-    <code>http://livesource:8080/live.m3u8?jump_at=10&amp;jump_by=8</code>（窗口跳号）。
+    <code>http://livesource:8080/live.m3u8?jump_at=10&amp;jump_by=8</code>（窗口跳号）、
+    <code>http://livesource:8080/live.m3u8?rewrite=2</code>（同序号同地址 TS 改写 → 复核冲突）。
   </p>
 </div>
 
 <div class="card">
   <table>
     <thead>
-      <tr><th>ID</th><th>清单地址</th><th>状态</th><th>进度</th><th>窗口</th><th>缺段/错误</th><th>操作</th></tr>
+      <tr><th>ID</th><th>清单地址</th><th>状态</th><th>进度</th><th>窗口</th><th>复核情况</th><th>缺段/错误</th><th>操作</th></tr>
     </thead>
     <tbody id="jobs"></tbody>
   </table>
 </div>
 
 <script>
+const VERIFY_LABEL = {
+  verified: '已复核（原件一致）',
+  unverified: '待复核（尚无复取结论，不得视为一致）',
+  verifying: '复取进行中',
+  no_opportunity: '未获得复核机会（已滑出窗口，不得视为一致）',
+  conflict: '内容冲突（同序号同地址 TS 被改写）',
+};
+
+function verifySummary(j) {
+  const v = j.verify || {};
+  const parts = [];
+  if (v.verified) parts.push(`<span class="v-verified">已复核 ${v.verified}</span>`);
+  if (v.verifying) parts.push(`<span class="v-verifying">复取中 ${v.verifying}</span>`);
+  if (v.unverified) parts.push(`<span class="v-unverified">待复核 ${v.unverified}</span>`);
+  if (v.no_opportunity) parts.push(`<span class="v-no_opportunity">未获复核机会 ${v.no_opportunity}</span>`);
+  if (v.conflict) parts.push(`<span class="v-conflict">冲突 ${v.conflict}</span>`);
+  let html = parts.length ? `<div class="verify-line">${parts.join('　')}</div>`
+                          : `<div class="verify-line muted">—</div>`;
+  if (j.conflicts && j.conflicts.length) {
+    html += `<div class="verify-line v-conflict">冲突序号: ${j.conflicts.join(', ')}</div>`;
+  }
+  return html;
+}
+
 async function refresh() {
   try {
     const r = await fetch('/api/jobs');
@@ -62,14 +97,40 @@ async function refresh() {
       let ops = '';
       if (j.state === 'recording') ops += `<button onclick="stopJob(${j.id})">停止</button> `;
       if (j.state === 'done') ops += `<a href="${j.download_url}">下载 ZIP</a>`;
+      ops += ` <button onclick="toggleDetail(${j.id})">片段明细</button>`;
       tr.innerHTML = `<td>${j.id}</td><td style="word-break:break-all">${j.url}</td>`
         + `<td class="state-${j.state}">${j.state}</td>`
         + `<td>${j.saved} / ${j.expected}</td><td>${win}</td>`
+        + `<td>${verifySummary(j)}</td>`
         + `<td>${miss}${err}</td><td>${ops}</td>`;
+      const detailTr = document.createElement('tr');
+      detailTr.innerHTML = `<td colspan="8"><div class="detail" id="detail-${j.id}">加载中…</div></td>`;
       tbody.appendChild(tr);
+      tbody.appendChild(detailTr);
     }
   } catch (e) { console.error(e); }
 }
+
+async function toggleDetail(id) {
+  const box = document.getElementById('detail-' + id);
+  const show = box.style.display !== 'block';
+  box.style.display = show ? 'block' : 'none';
+  if (!show) return;
+  const r = await fetch(`/api/jobs/${id}/segments`);
+  const segs = await r.json();
+  let html = '<table><thead><tr><th>序号</th><th>保存状态</th><th>复核状态</th><th>复核尝试</th><th>首次 SHA-256</th><th>错误</th></tr></thead><tbody>';
+  for (const s of segs) {
+    const vcls = 'v-' + s.verify_status;
+    html += `<tr><td>${s.seq}</td><td>${s.status}</td>`
+      + `<td class="${vcls}">${VERIFY_LABEL[s.verify_status] || s.verify_status}</td>`
+      + `<td>${s.verify_attempts}</td>`
+      + `<td class="hash">${s.sha256 || '—'}</td>`
+      + `<td class="err">${s.error || ''}</td></tr>`;
+  }
+  html += '</tbody></table>';
+  box.innerHTML = html;
+}
+
 async function startJob() {
   const url = document.getElementById('url').value.trim();
   if (!url) return;
